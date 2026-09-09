@@ -399,6 +399,7 @@ pub(super) fn render_panes(
         return;
     };
 
+    let dim_unfocused = app.pane_dim_unfocused && pane_infos.len() > 1;
     for info in pane_infos {
         if let Some(rt) = app.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, info.id) {
             let show_cursor = info.is_focused
@@ -406,10 +407,35 @@ pub(super) fn render_panes(
                 && app.pane_exposes_host_cursor(ws_idx, info.id);
             rt.render(frame, info.inner_rect, show_cursor);
             render_pane_scrollbar(app, frame, info, rt);
+            if dim_unfocused && !info.is_focused {
+                dim_rect(frame, info.inner_rect);
+            }
         }
     }
 
     render_pane_borders(app, ws, pane_infos, split_borders, frame);
+}
+
+/// Add the `DIM` modifier to every cell in `rect`, clamped to the frame buffer.
+/// Used to fade an unfocused split pane's content when `pane_dim_unfocused` is
+/// set, so the focused pane stands out without relying on borders.
+fn dim_rect(frame: &mut Frame, rect: Rect) {
+    let buf = frame.buffer_mut();
+    let area = buf.area;
+    for y in rect.top()..rect.bottom() {
+        for x in rect.left()..rect.right() {
+            if x < area.x
+                || x >= area.x.saturating_add(area.width)
+                || y < area.y
+                || y >= area.y.saturating_add(area.height)
+            {
+                continue;
+            }
+            let cell = &mut buf[(x, y)];
+            let style = cell.style().add_modifier(Modifier::DIM);
+            cell.set_style(style);
+        }
+    }
 }
 
 pub(crate) fn popup_pane_rects(app: &AppState, area: Rect) -> Option<(Rect, Rect)> {
