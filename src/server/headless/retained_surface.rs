@@ -313,6 +313,24 @@ impl HeadlessServer {
             let Some((workspace_index, pane_id)) = self.app.parse_pane_id(&public_pane_id) else {
                 fallback!("pane_missing");
             };
+            // This fast path patches PTY output straight into the frame without
+            // running render_panes, so it never applies the unfocused-pane dim.
+            // Left here, a dimmed pane flashes bright on every content update.
+            // Fall back to the full renderer for an unfocused pane while
+            // pane_dim_unfocused is set, so the dim is re-applied.
+            if self.app.state.pane_dim_unfocused
+                && self
+                    .app
+                    .state
+                    .workspaces
+                    .get(workspace_index)
+                    .and_then(|ws| ws.active_tab())
+                    .is_some_and(|tab| {
+                        tab.layout.pane_count() > 1 && tab.layout.focused() != pane_id
+                    })
+            {
+                fallback!("dim_unfocused");
+            }
             let Some(runtime) = self.app.state.runtime_for_pane_in_workspace(
                 &self.app.terminal_runtimes,
                 workspace_index,
