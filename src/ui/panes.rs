@@ -16,6 +16,7 @@ use crate::app::AppState;
 use crate::layout::PaneInfo;
 use crate::popup_size::resolve_popup_geometry;
 use crate::terminal::{TerminalRuntime, TerminalRuntimeRegistry};
+use crate::terminal_theme::TerminalTheme;
 
 pub(crate) fn pane_is_scrolled_back(rt: &TerminalRuntime) -> bool {
     rt.scroll_metrics()
@@ -408,7 +409,7 @@ pub(super) fn render_panes(
             rt.render(frame, info.inner_rect, show_cursor);
             render_pane_scrollbar(app, frame, info, rt);
             if dim_unfocused && !info.is_focused {
-                dim_rect(frame, info.inner_rect);
+                dim_rect(frame, info.inner_rect, &app.host_terminal_theme);
             }
         }
     }
@@ -416,10 +417,26 @@ pub(super) fn render_panes(
     render_pane_borders(app, ws, pane_infos, split_borders, frame);
 }
 
-/// Add the `DIM` modifier to every cell in `rect`, clamped to the frame buffer.
-/// Used to fade an unfocused split pane's content when `pane_dim_unfocused` is
-/// set, so the focused pane stands out without relying on borders.
-fn dim_rect(frame: &mut Frame, rect: Rect) {
+/// Foreground weight, as a percent, when blending an unfocused pane's text
+/// toward the background. 40 keeps the text legible while it clearly recedes.
+const DIM_FG_KEEP_PCT: u16 = 40;
+
+/// Fallback default foreground when the host terminal never reported one (a
+/// light gray). Used only when `TerminalTheme.foreground` is `None`.
+const DEFAULT_FG: (u8, u8, u8) = (0xcc, 0xcc, 0xcc);
+
+/// Fallback default background when the host terminal never reported one
+/// (black). Used only when `TerminalTheme.background` is `None`.
+const DEFAULT_BG: (u8, u8, u8) = (0x00, 0x00, 0x00);
+
+/// Blend every cell's foreground toward the terminal background so an
+/// unfocused split pane recedes. Unlike `Modifier::DIM` (SGR faint), this
+/// writes a concrete RGB color, so the dim is uniform and never collides with
+/// a cell's own bold or faint attribute. `theme` supplies the host terminal's
+/// reported colors; an unreported color resolves through a deterministic
+/// xterm-256 fallback.
+fn dim_rect(frame: &mut Frame, rect: Rect, theme: &TerminalTheme) {
+    let bg = theme.background.map_or(DEFAULT_BG, rgb_tuple);
     let buf = frame.buffer_mut();
     let area = buf.area;
     for y in rect.top()..rect.bottom() {
@@ -432,8 +449,98 @@ fn dim_rect(frame: &mut Frame, rect: Rect) {
                 continue;
             }
             let cell = &mut buf[(x, y)];
-            let style = cell.style().add_modifier(Modifier::DIM);
-            cell.set_style(style);
+            let current = cell.style();
+            let fg = resolve_fg(current.fg.unwrap_or(Color::Reset), theme);
+            let (r, g, b) = blend_rgb(fg, bg, DIM_FG_KEEP_PCT);
+            cell.set_style(current.fg(Color::Rgb(r, g, b)));
+        }
+    }
+}
+
+/// Convert a `TerminalTheme` `RgbColor` to a plain RGB tuple.
+fn rgb_tuple(color: crate::terminal_theme::RgbColor) -> (u8, u8, u8) {
+    (color.r, color.g, color.b)
+}
+
+/// Mix `fg` toward `bg`, keeping `keep_pct` percent of the foreground.
+fn blend_rgb(fg: (u8, u8, u8), bg: (u8, u8, u8), keep_pct: u16) -> (u8, u8, u8) {
+    let mix = |f: u8, b: u8| -> u8 {
+        let f = u16::from(f);
+        let b = u16::from(b);
+        ((f * keep_pct + b * (100 - keep_pct)) / 100) as u8
+    };
+    (mix(fg.0, bg.0), mix(fg.1, bg.1), mix(fg.2, bg.2))
+}
+
+/// Resolve a ratatui foreground `Color` to a concrete RGB triple. `Reset`
+/// takes the host terminal's default foreground (or [`DEFAULT_FG`]); a named
+/// or indexed color takes the host terminal's reported palette entry (or the
+/// xterm-256 fallback).
+fn resolve_fg(color: Color, theme: &TerminalTheme) -> (u8, u8, u8) {
+    match color {
+        Color::Rgb(r, g, b) => (r, g, b),
+        Color::Reset => theme.foreground.map_or(DEFAULT_FG, rgb_tuple),
+        Color::Indexed(n) => palette_color(theme, n),
+        Color::Black => palette_color(theme, 0),
+        Color::Red => palette_color(theme, 1),
+        Color::Green => palette_color(theme, 2),
+        Color::Yellow => palette_color(theme, 3),
+        Color::Blue => palette_color(theme, 4),
+        Color::Magenta => palette_color(theme, 5),
+        Color::Cyan => palette_color(theme, 6),
+        Color::Gray => palette_color(theme, 7),
+        Color::DarkGray => palette_color(theme, 8),
+        Color::LightRed => palette_color(theme, 9),
+        Color::LightGreen => palette_color(theme, 10),
+        Color::LightYellow => palette_color(theme, 11),
+        Color::LightBlue => palette_color(theme, 12),
+        Color::LightMagenta => palette_color(theme, 13),
+        Color::LightCyan => palette_color(theme, 14),
+        Color::White => palette_color(theme, 15),
+    }
+}
+
+/// Look up palette index `n` in the host terminal's reported palette, falling
+/// back to the deterministic xterm-256 color when the terminal never reported
+/// it.
+fn palette_color(theme: &TerminalTheme, n: u8) -> (u8, u8, u8) {
+    theme.palette[usize::from(n)].map_or_else(|| xterm_256_fallback(n), rgb_tuple)
+}
+
+/// The standard 16 ANSI colors, used when the host terminal did not report a
+/// palette entry for an index in 0..=15.
+const ANSI_16: [(u8, u8, u8); 16] = [
+    (0x00, 0x00, 0x00),
+    (0x80, 0x00, 0x00),
+    (0x00, 0x80, 0x00),
+    (0x80, 0x80, 0x00),
+    (0x00, 0x00, 0x80),
+    (0x80, 0x00, 0x80),
+    (0x00, 0x80, 0x80),
+    (0xc0, 0xc0, 0xc0),
+    (0x80, 0x80, 0x80),
+    (0xff, 0x00, 0x00),
+    (0x00, 0xff, 0x00),
+    (0xff, 0xff, 0x00),
+    (0x00, 0x00, 0xff),
+    (0xff, 0x00, 0xff),
+    (0x00, 0xff, 0xff),
+    (0xff, 0xff, 0xff),
+];
+
+/// Deterministic xterm-256 color for index `n`: the standard 16 colors, the
+/// 6x6x6 color cube (16..=231), then the grayscale ramp (232..=255).
+fn xterm_256_fallback(n: u8) -> (u8, u8, u8) {
+    match n {
+        0..=15 => ANSI_16[usize::from(n)],
+        16..=231 => {
+            let n = n - 16;
+            let level = |c: u8| if c == 0 { 0 } else { 55 + 40 * c };
+            (level(n / 36), level((n / 6) % 6), level(n % 6))
+        }
+        232..=255 => {
+            let gray = 8 + 10 * (n - 232);
+            (gray, gray, gray)
         }
     }
 }
@@ -871,6 +978,55 @@ mod tests {
         frame: &mut Frame,
     ) {
         render_pane_borders(app, ws, &app.view.pane_infos, split_borders, frame);
+    }
+
+    #[test]
+    fn blend_rgb_keeps_the_named_percent_of_foreground() {
+        // 40% of the foreground, 60% of the background, per channel.
+        assert_eq!(blend_rgb((255, 255, 255), (0, 0, 0), 40), (102, 102, 102));
+        // Blends toward a non-black background channel-wise.
+        assert_eq!(blend_rgb((255, 255, 255), (0, 0, 64), 40), (102, 102, 140));
+        // Keeping 100 percent is a no-op; keeping 0 is the background.
+        assert_eq!(blend_rgb((10, 20, 30), (0, 0, 0), 100), (10, 20, 30));
+        assert_eq!(blend_rgb((10, 20, 30), (1, 2, 3), 0), (1, 2, 3));
+    }
+
+    #[test]
+    fn xterm_256_fallback_covers_the_three_ranges() {
+        assert_eq!(xterm_256_fallback(0), (0x00, 0x00, 0x00));
+        assert_eq!(xterm_256_fallback(15), (0xff, 0xff, 0xff));
+        // Cube base (16) is black; 196 is pure red; 231 is white.
+        assert_eq!(xterm_256_fallback(16), (0, 0, 0));
+        assert_eq!(xterm_256_fallback(196), (255, 0, 0));
+        assert_eq!(xterm_256_fallback(231), (255, 255, 255));
+        // Grayscale ramp start and end.
+        assert_eq!(xterm_256_fallback(232), (8, 8, 8));
+        assert_eq!(xterm_256_fallback(255), (238, 238, 238));
+    }
+
+    #[test]
+    fn resolve_fg_prefers_reported_colors_then_falls_back() {
+        use crate::terminal_theme::{DefaultColorKind, RgbColor};
+
+        // Reset without a reported foreground uses the light-gray fallback.
+        let empty = TerminalTheme::default();
+        assert_eq!(resolve_fg(Color::Reset, &empty), DEFAULT_FG);
+
+        // Reset with a reported foreground uses it.
+        let with_fg = TerminalTheme::default()
+            .with_color(DefaultColorKind::Foreground, RgbColor { r: 1, g: 2, b: 3 });
+        assert_eq!(resolve_fg(Color::Reset, &with_fg), (1, 2, 3));
+
+        // A named color with no reported palette entry uses the ANSI-16 table.
+        assert_eq!(resolve_fg(Color::Red, &empty), (0x80, 0x00, 0x00));
+
+        // A reported palette entry wins over the fallback.
+        let with_red =
+            TerminalTheme::default().with_palette_color(1, RgbColor { r: 9, g: 9, b: 9 });
+        assert_eq!(resolve_fg(Color::Red, &with_red), (9, 9, 9));
+
+        // Truecolor passes straight through.
+        assert_eq!(resolve_fg(Color::Rgb(4, 5, 6), &empty), (4, 5, 6));
     }
 
     #[test]
