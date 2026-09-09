@@ -429,14 +429,18 @@ const DEFAULT_FG: (u8, u8, u8) = (0xcc, 0xcc, 0xcc);
 /// (black). Used only when `TerminalTheme.background` is `None`.
 const DEFAULT_BG: (u8, u8, u8) = (0x00, 0x00, 0x00);
 
-/// Blend every cell's foreground toward the terminal background so an
-/// unfocused split pane recedes. Unlike `Modifier::DIM` (SGR faint), this
-/// writes a concrete RGB color, so the dim is uniform and never collides with
-/// a cell's own bold or faint attribute. `theme` supplies the host terminal's
-/// reported colors; an unreported color resolves through a deterministic
-/// xterm-256 fallback.
+/// Blend a cell's foreground, and any concrete background, toward the terminal
+/// background so an unfocused split pane recedes. Unlike `Modifier::DIM` (SGR
+/// faint), this writes concrete RGB colors, so the dim is uniform and never
+/// collides with a cell's own bold or faint attribute. A default (`Reset`)
+/// background is left untouched, so a plain cell keeps the pane's own
+/// background; a concrete background (for example a starship prompt segment)
+/// recedes with the same ratio as the foreground. `theme` supplies the host
+/// terminal's reported colors; an unreported color resolves through a
+/// deterministic xterm-256 fallback.
 fn dim_rect(frame: &mut Frame, rect: Rect, theme: &TerminalTheme) {
-    let bg = theme.background.map_or(DEFAULT_BG, rgb_tuple);
+    let bg_target = theme.background.map_or(DEFAULT_BG, rgb_tuple);
+    let fg_default = theme.foreground.map_or(DEFAULT_FG, rgb_tuple);
     let buf = frame.buffer_mut();
     let area = buf.area;
     for y in rect.top()..rect.bottom() {
@@ -450,9 +454,17 @@ fn dim_rect(frame: &mut Frame, rect: Rect, theme: &TerminalTheme) {
             }
             let cell = &mut buf[(x, y)];
             let current = cell.style();
-            let fg = resolve_fg(current.fg.unwrap_or(Color::Reset), theme);
-            let (r, g, b) = blend_rgb(fg, bg, DIM_FG_KEEP_PCT);
-            cell.set_style(current.fg(Color::Rgb(r, g, b)));
+            let fg = resolve_color(current.fg.unwrap_or(Color::Reset), theme, fg_default);
+            let (fr, fg_g, fb) = blend_rgb(fg, bg_target, DIM_FG_KEEP_PCT);
+            let mut dimmed = current.fg(Color::Rgb(fr, fg_g, fb));
+            if let Some(cell_bg) = current.bg {
+                if cell_bg != Color::Reset {
+                    let bg = resolve_color(cell_bg, theme, bg_target);
+                    let (br, bg_g, bb) = blend_rgb(bg, bg_target, DIM_FG_KEEP_PCT);
+                    dimmed = dimmed.bg(Color::Rgb(br, bg_g, bb));
+                }
+            }
+            cell.set_style(dimmed);
         }
     }
 }
@@ -472,14 +484,15 @@ fn blend_rgb(fg: (u8, u8, u8), bg: (u8, u8, u8), keep_pct: u16) -> (u8, u8, u8) 
     (mix(fg.0, bg.0), mix(fg.1, bg.1), mix(fg.2, bg.2))
 }
 
-/// Resolve a ratatui foreground `Color` to a concrete RGB triple. `Reset`
-/// takes the host terminal's default foreground (or [`DEFAULT_FG`]); a named
+/// Resolve a ratatui `Color` to a concrete RGB triple. `Reset` takes
+/// `reset_default` (the caller passes the terminal's default foreground for a
+/// foreground color, or its default background for a background color); a named
 /// or indexed color takes the host terminal's reported palette entry (or the
 /// xterm-256 fallback).
-fn resolve_fg(color: Color, theme: &TerminalTheme) -> (u8, u8, u8) {
+fn resolve_color(color: Color, theme: &TerminalTheme, reset_default: (u8, u8, u8)) -> (u8, u8, u8) {
     match color {
         Color::Rgb(r, g, b) => (r, g, b),
-        Color::Reset => theme.foreground.map_or(DEFAULT_FG, rgb_tuple),
+        Color::Reset => reset_default,
         Color::Indexed(n) => palette_color(theme, n),
         Color::Black => palette_color(theme, 0),
         Color::Red => palette_color(theme, 1),
@@ -1005,28 +1018,30 @@ mod tests {
     }
 
     #[test]
-    fn resolve_fg_prefers_reported_colors_then_falls_back() {
+    fn resolve_color_prefers_reported_colors_then_falls_back() {
         use crate::terminal_theme::{DefaultColorKind, RgbColor};
 
-        // Reset without a reported foreground uses the light-gray fallback.
+        // Reset takes the caller-supplied default (foreground or background).
         let empty = TerminalTheme::default();
-        assert_eq!(resolve_fg(Color::Reset, &empty), DEFAULT_FG);
+        assert_eq!(resolve_color(Color::Reset, &empty, DEFAULT_FG), DEFAULT_FG);
+        assert_eq!(resolve_color(Color::Reset, &empty, DEFAULT_BG), DEFAULT_BG);
 
         // Reset with a reported foreground uses it.
         let with_fg = TerminalTheme::default()
             .with_color(DefaultColorKind::Foreground, RgbColor { r: 1, g: 2, b: 3 });
-        assert_eq!(resolve_fg(Color::Reset, &with_fg), (1, 2, 3));
+        let fg_default = with_fg.foreground.map_or(DEFAULT_FG, rgb_tuple);
+        assert_eq!(resolve_color(Color::Reset, &with_fg, fg_default), (1, 2, 3));
 
         // A named color with no reported palette entry uses the ANSI-16 table.
-        assert_eq!(resolve_fg(Color::Red, &empty), (0x80, 0x00, 0x00));
+        assert_eq!(resolve_color(Color::Red, &empty, DEFAULT_FG), (0x80, 0x00, 0x00));
 
         // A reported palette entry wins over the fallback.
         let with_red =
             TerminalTheme::default().with_palette_color(1, RgbColor { r: 9, g: 9, b: 9 });
-        assert_eq!(resolve_fg(Color::Red, &with_red), (9, 9, 9));
+        assert_eq!(resolve_color(Color::Red, &with_red, DEFAULT_FG), (9, 9, 9));
 
         // Truecolor passes straight through.
-        assert_eq!(resolve_fg(Color::Rgb(4, 5, 6), &empty), (4, 5, 6));
+        assert_eq!(resolve_color(Color::Rgb(4, 5, 6), &empty, DEFAULT_FG), (4, 5, 6));
     }
 
     #[test]
